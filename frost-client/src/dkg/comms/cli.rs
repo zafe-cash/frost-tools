@@ -61,6 +61,19 @@ where
         ))
     }
 
+    async fn get_threshold_and_description(
+        &mut self,
+        _input: &mut dyn BufRead,
+        _output: &mut dyn Write,
+    ) -> Result<(u16, Option<String>), Box<dyn Error>> {
+        Ok((
+            self.args
+                .min_signers
+                .ok_or_eyre("min_signers must be specified")?,
+            self.args.description.clone(),
+        ))
+    }
+
     async fn get_round1_packages(
         &mut self,
         mut input: &mut dyn BufRead,

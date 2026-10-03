@@ -19,13 +19,24 @@ use frost_core::{
 use crate::cipher::Cipher;
 use crate::client::Client;
 use crate::{
-    api::{self, PublicKey, Uuid},
+    api::{self, Msg, PublicKey, Uuid},
     session::DKGSessionState,
 };
 use rand::thread_rng;
+use serde::{Deserialize, Serialize};
 
 use super::super::args::ProcessedArgs;
 use super::Comms;
+
+/// The DKG parameters which the participant who created the DKG session sends
+/// to the other participants before Round 1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DKGParams {
+    /// The threshold (minimum number of signers).
+    pub threshold: u16,
+    /// The group description.
+    pub description: Option<String>,
+}
 
 pub struct HTTPComms<C: Ciphersuite> {
     client: Client,
@@ -34,7 +45,12 @@ pub struct HTTPComms<C: Ciphersuite> {
     state: DKGSessionState<C>,
     identifier: Option<Identifier<C>>,
     pubkeys: HashMap<PublicKey, Identifier<C>>,
+    /// The public key of the participant who created the DKG session.
+    coordinator_pubkey: Option<PublicKey>,
     cipher: Option<Cipher>,
+    /// Messages received from other participants while waiting for the DKG
+    /// parameters, to be handled in Round 1.
+    pending_msgs: Vec<Msg>,
     _phantom: PhantomData<C>,
 }
 
@@ -47,7 +63,9 @@ impl<C: Ciphersuite> HTTPComms<C> {
             state: DKGSessionState::default(),
             identifier: None,
             pubkeys: Default::default(),
+            coordinator_pubkey: None,
             cipher: None,
+            pending_msgs: Vec::new(),
             _phantom: Default::default(),
         })
     }
@@ -87,6 +105,19 @@ impl<C: Ciphersuite + 'static> Comms<C> for HTTPComms<C> {
             .await?;
 
         let session_id = if !self.args.participants.is_empty() {
+            // Validate the threshold before creating the session, since the
+            // other participants will use the one we send them.
+            let min_signers = self
+                .args
+                .min_signers
+                .ok_or_eyre("threshold must be specified when creating a DKG session")?;
+            if min_signers < 2 || min_signers as usize > self.args.participants.len() {
+                return Err(eyre!(
+                    "threshold must be at least 2 and at most the number of participants ({})",
+                    self.args.participants.len()
+                )
+                .into());
+            }
             eprintln!("Creating DKG session...");
             let r = self
                 .client
@@ -135,6 +166,7 @@ impl<C: Ciphersuite + 'static> Comms<C> for HTTPComms<C> {
         if self.pubkeys.len() < 2 {
             return Err(eyre!("DKG session must have at least 2 participants").into());
         }
+        self.coordinator_pubkey = Some(session_info.coordinator_pubkey);
 
         // Copy the pubkeys into the state.
         match self.state {
@@ -156,12 +188,11 @@ impl<C: Ciphersuite + 'static> Comms<C> for HTTPComms<C> {
         Ok((identifier, self.pubkeys.len() as u16))
     }
 
-    async fn get_round1_packages(
+    async fn get_threshold_and_description(
         &mut self,
         _input: &mut dyn BufRead,
         _output: &mut dyn Write,
-        round1_package: round1::Package<C>,
-    ) -> Result<BTreeMap<Identifier<C>, round1::Package<C>>, Box<dyn Error>> {
+    ) -> Result<(u16, Option<String>), Box<dyn Error>> {
         let (Some(comm_privkey), Some(comm_participant_pubkey_getter)) = (
             &self.args.comm_privkey,
             &self.args.comm_participant_pubkey_getter,
@@ -179,6 +210,143 @@ impl<C: Ciphersuite + 'static> Comms<C> for HTTPComms<C> {
         )?;
         self.cipher = Some(cipher);
         let cipher = self.cipher.as_mut().expect("was just set");
+
+        // The participant who created the session sends the DKG parameters to
+        // the other participants. The messages are encrypted and authenticated
+        // like all others, so the server can't change them.
+        if !self.args.participants.is_empty() {
+            let params = DKGParams {
+                threshold: self
+                    .args
+                    .min_signers
+                    .ok_or_eyre("threshold must be specified")?,
+                description: self.args.description.clone(),
+            };
+            eprintln!("Sending the threshold and description to other participants...");
+            for pubkey in self.pubkeys.clone().keys() {
+                if Some(pubkey) == self.args.comm_pubkey.as_ref() {
+                    continue;
+                }
+                let msg = cipher.encrypt(Some(pubkey), serde_json::to_vec(&params)?)?;
+                self.client
+                    .send(&api::SendArgs {
+                        session_id: self.session_id.expect("set before"),
+                        recipients: vec![pubkey.clone()],
+                        msg,
+                    })
+                    .await?;
+            }
+            return Ok((params.threshold, params.description));
+        }
+
+        let coordinator_pubkey = self
+            .coordinator_pubkey
+            .clone()
+            .expect("set in get_identifier_and_max_signers()");
+        if Some(&coordinator_pubkey) == self.args.comm_pubkey.as_ref() {
+            return Err(eyre!(
+                "the DKG session was created by this user; specify the participants only when creating a new session"
+            )
+            .into());
+        }
+        if !self.pubkeys.contains_key(&coordinator_pubkey) {
+            return Err(eyre!(
+                "the user who created the DKG session is not one of its participants"
+            )
+            .into());
+        }
+
+        eprint!("Waiting for the session creator to send the threshold and description...");
+
+        let params = loop {
+            let r = self
+                .client
+                .receive(&api::ReceiveArgs {
+                    session_id: self.session_id.unwrap(),
+                    as_coordinator: false,
+                })
+                .await?;
+            let mut params: Option<DKGParams> = None;
+            for msg in r.msgs {
+                let msg = cipher.decrypt(msg)?;
+                // The first message from the session creator must contain the
+                // parameters. Other participants might have already received
+                // them and sent their Round 1 Packages; keep them for later.
+                if params.is_none() && msg.sender == coordinator_pubkey {
+                    params = Some(serde_json::from_slice(&msg.msg).map_err(|_| {
+                        eyre!("invalid DKG parameters received from the session creator (are all participants using the same frost-client version?)")
+                    })?);
+                } else {
+                    self.pending_msgs.push(msg);
+                }
+            }
+            if let Some(params) = params {
+                break params;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            eprint!(".");
+        };
+        eprintln!();
+
+        let max_signers = self.pubkeys.len();
+        if params.threshold < 2 || params.threshold as usize > max_signers {
+            return Err(eyre!(
+                "invalid threshold received from the session creator: {} (must be at least 2 and at most the number of participants, {})",
+                params.threshold,
+                max_signers
+            )
+            .into());
+        }
+        if let Some(min_signers) = self.args.min_signers {
+            if min_signers != params.threshold {
+                return Err(eyre!(
+                    "the threshold specified ({}) does not match the threshold sent by the session creator ({})",
+                    min_signers,
+                    params.threshold
+                )
+                .into());
+            }
+        }
+        if let Some(description) = &params.description {
+            // Don't allow the session creator to write control characters
+            // (e.g. terminal escape sequences) into the config file or terminal.
+            if description.chars().any(char::is_control) {
+                return Err(eyre!("invalid description received from the session creator").into());
+            }
+        }
+        // A description specified by the user takes precedence, since it is
+        // only used locally to identify the group.
+        let description = self.args.description.clone().or(params.description);
+
+        eprintln!(
+            "Using threshold {} of {} participants{}",
+            params.threshold,
+            max_signers,
+            description
+                .as_ref()
+                .map(|d| format!(" and description \"{d}\""))
+                .unwrap_or_default()
+        );
+
+        Ok((params.threshold, description))
+    }
+
+    async fn get_round1_packages(
+        &mut self,
+        _input: &mut dyn BufRead,
+        _output: &mut dyn Write,
+        round1_package: round1::Package<C>,
+    ) -> Result<BTreeMap<Identifier<C>, round1::Package<C>>, Box<dyn Error>> {
+        let cipher = self
+            .cipher
+            .as_mut()
+            .expect("set in get_threshold_and_description()");
+
+        // Handle messages received while waiting for the DKG parameters.
+        for msg in std::mem::take(&mut self.pending_msgs) {
+            self.state
+                .recv(msg, self.identifier.expect("must have been set"))?;
+        }
 
         // Send Round 1 Package to all other participants
         for pubkey in self.pubkeys.clone().keys() {

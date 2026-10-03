@@ -28,6 +28,18 @@ pub trait Comms<C: Ciphersuite> {
         output: &mut dyn Write,
     ) -> Result<(Identifier<C>, u16), Box<dyn Error>>;
 
+    /// Return the threshold (minimum number of signers) and the group
+    /// description, if any.
+    ///
+    /// In HTTP mode, the participant who created the DKG session sends them to
+    /// the other participants, which requires an additional round of
+    /// communication.
+    async fn get_threshold_and_description(
+        &mut self,
+        input: &mut dyn BufRead,
+        output: &mut dyn Write,
+    ) -> Result<(u16, Option<String>), Box<dyn Error>>;
+
     /// Send the Round 1 package to other participants (using echo broadcast),
     /// and receive their Round 1 packages.
     async fn get_round1_packages(

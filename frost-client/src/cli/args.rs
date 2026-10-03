@@ -115,16 +115,23 @@ pub enum Command {
         config: Option<String>,
         /// A description of the group being created. Will be written to the
         /// participant's config files and will help them identify groups.
+        /// Required for the first participant who creates the DKG session,
+        /// which sends it to the other participants. The other participants
+        /// can specify it to use a different description in their own config
+        /// file.
         #[arg(short, long)]
-        description: String,
+        description: Option<String>,
         /// The server URL through which DKG will be run.
         #[arg(short, long)]
         server_url: String,
         #[arg(short = 'C', long, default_value = "ed25519")]
         ciphersuite: String,
-        /// The threshold (minimum number of signers).
+        /// The threshold (minimum number of signers). Required for the first
+        /// participant who creates the DKG session, which sends it to the
+        /// other participants. The other participants can specify it to check
+        /// that it matches the threshold they received.
         #[arg(short = 't', long)]
-        threshold: u16,
+        threshold: Option<u16>,
         /// The comma-separated hex-encoded public keys of the other
         /// participants to use. Must be specified only for the first participant
         /// who creates the DKG session.

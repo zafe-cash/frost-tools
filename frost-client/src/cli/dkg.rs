@@ -48,6 +48,15 @@ pub(crate) async fn dkg_for_ciphersuite<C: Ciphersuite + MaybeIntoEvenY + 'stati
         panic!("invalid Command");
     };
 
+    // The first participant (who creates the session) chooses the threshold
+    // and description, and sends them to the other participants.
+    if !participants.is_empty() && (threshold.is_none() || description.is_none()) {
+        return Err(eyre!(
+            "the threshold and description must be specified when creating a DKG session"
+        )
+        .into());
+    }
+
     let mut input = Box::new(std::io::stdin().lock());
     let mut output = std::io::stdout();
 
@@ -98,14 +107,19 @@ pub(crate) async fn dkg_for_ciphersuite<C: Ciphersuite + MaybeIntoEvenY + 'stati
                 .ok()
         })),
         min_signers: threshold,
+        description,
         max_signers: None,
         participants,
         identifier: None,
     };
 
     // Generate key shares
-    let (key_package, public_key_package, pubkey_map) =
+    let (key_package, public_key_package, pubkey_map, description) =
         cli::cli_for_processed_args::<C>(dkg_config, &mut input, &mut output).await?;
+    // The session creator might not have sent a description (frost-client
+    // always does, but other tools might not); don't fail at this point since
+    // the key shares must be saved.
+    let description = description.unwrap_or_default();
     let key_package = Zeroizing::new(key_package);
 
     // Reverse pubkey_map
@@ -127,7 +141,7 @@ pub(crate) async fn dkg_for_ciphersuite<C: Ciphersuite + MaybeIntoEvenY + 'stati
 
     let group = Group {
         ciphersuite: C::ID.to_string(),
-        description: description.clone(),
+        description,
         key_package: postcard::to_allocvec(&key_package)?,
         public_key_package: postcard::to_allocvec(&public_key_package)?,
         participant: participants.clone(),

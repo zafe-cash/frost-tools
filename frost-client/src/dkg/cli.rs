@@ -54,7 +54,7 @@ pub async fn cli<C: Ciphersuite + 'static + MaybeIntoEvenY>(
     let config = request_inputs::<C>(reader, logger)?;
     let pargs = ProcessedArgs::<C>::new(&config);
 
-    let (key_package, public_key_package, _) =
+    let (key_package, public_key_package, _, _) =
         cli_for_processed_args(pargs, reader, logger).await?;
 
     writeln!(
@@ -80,6 +80,7 @@ pub async fn cli_for_processed_args<C: Ciphersuite + 'static + MaybeIntoEvenY>(
         KeyPackage<C>,
         PublicKeyPackage<C>,
         HashMap<PublicKey, Identifier<C>>,
+        Option<String>,
     ),
     Box<dyn Error>,
 > {
@@ -97,9 +98,10 @@ pub async fn cli_for_processed_args<C: Ciphersuite + 'static + MaybeIntoEvenY>(
         let rng = thread_rng();
 
         let (identifier, max_signers) = comms.get_identifier_and_max_signers(input, logger).await?;
+        let (min_signers, description) = comms.get_threshold_and_description(input, logger).await?;
 
         let (round1_secret_package, round1_package) =
-            frost::keys::dkg::part1(identifier, max_signers, pargs.min_signers, rng)?;
+            frost::keys::dkg::part1(identifier, max_signers, min_signers, rng)?;
 
         let received_round1_packages = comms
             .get_round1_packages(input, logger, round1_package)
@@ -121,7 +123,7 @@ pub async fn cli_for_processed_args<C: Ciphersuite + 'static + MaybeIntoEvenY>(
             )?);
 
         let pubkey_map = comms.get_pubkey_identifier_map()?;
-        Ok((key_package, public_key_package, pubkey_map))
+        Ok((key_package, public_key_package, pubkey_map, description))
     };
 
     let r = doit.await;

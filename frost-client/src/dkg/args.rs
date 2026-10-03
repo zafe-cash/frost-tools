@@ -46,8 +46,18 @@ pub struct ProcessedArgs<C: Ciphersuite> {
     #[zeroize(skip)]
     pub comm_participant_pubkey_getter: Option<Rc<dyn Fn(&PublicKey) -> Option<PublicKey>>>,
 
-    /// The threshold to use for the shares
-    pub min_signers: u16,
+    /// The threshold to use for the shares. In HTTP mode, it is required for
+    /// the first participant who creates the DKG session (who sends it to the
+    /// other participants); for the other participants it is optional, and if
+    /// specified it must match the threshold sent by the first participant.
+    pub min_signers: Option<u16>,
+
+    /// The group description. In HTTP mode, it is required for the first
+    /// participant who creates the DKG session (who sends it to the other
+    /// participants); for the other participants it is optional, and if
+    /// specified it is used instead of the description sent by the first
+    /// participant.
+    pub description: Option<String>,
 
     /// The total number of signers. Only needed for CLI mode.
     pub max_signers: Option<u16>,
@@ -76,7 +86,8 @@ where
             comm_privkey: None,
             comm_pubkey: None,
             comm_participant_pubkey_getter: None,
-            min_signers: config.min_signers,
+            min_signers: Some(config.min_signers),
+            description: None,
             max_signers: Some(config.max_signers),
             participants: Vec::new(),
             identifier: Some(config.identifier),
